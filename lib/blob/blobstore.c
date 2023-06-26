@@ -7174,6 +7174,197 @@ spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *ch
 }
 /* END spdk_bs_blob_shallow_copy */
 
+/* START spdk_bs_blob_set_parent */
+
+struct spdk_blob_set_parent_ctx {
+	struct spdk_blob_store *bs;
+	int bserrno;
+	spdk_bs_op_complete	cb_fn;
+	void *cb_arg;
+
+	struct spdk_blob *blob;
+	struct {
+		spdk_blob_id id;
+		struct spdk_blob *blob;
+	} parent;
+};
+
+static void
+bs_blob_set_parent_cleanup_finish(void *cb_arg, int bserrno)
+{
+	struct spdk_blob_set_parent_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		if (ctx->bserrno == 0) {
+			SPDK_ERRLOG("Blob set parent cleanup error %d\n", bserrno);
+			ctx->bserrno = bserrno;
+		}
+	}
+
+	ctx->cb_fn(ctx->cb_arg, ctx->bserrno);
+
+	free(ctx);
+}
+
+static void
+bs_blob_set_parent_close_parent(void *cb_arg, int bserrno)
+{
+	struct spdk_blob_set_parent_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		if (ctx->bserrno == 0) {
+			SPDK_ERRLOG("Blob set parent close snapshot error %d\n", bserrno);
+			ctx->bserrno = bserrno;
+		}
+	}
+
+	spdk_blob_close(ctx->parent.blob, bs_blob_set_parent_cleanup_finish, ctx);
+}
+
+static void
+bs_blob_set_parent_close_blob(void *cb_arg, int bserrno)
+{
+	struct spdk_blob_set_parent_ctx *ctx = cb_arg;
+	struct spdk_blob *blob = ctx->blob;
+
+	if (bserrno != 0) {
+		if (ctx->bserrno == 0) {
+			SPDK_ERRLOG("Blob set parent close blob error %d\n", bserrno);
+			ctx->bserrno = bserrno;
+		}
+	}
+
+	blob->locked_operation_in_progress = false;
+
+	spdk_blob_close(blob, bs_blob_set_parent_close_parent, ctx);
+}
+
+static void
+bs_blob_set_parent_snapshot_open_cpl(void *cb_arg, struct spdk_blob *parent, int bserrno)
+{
+	struct spdk_blob_set_parent_ctx *ctx = (struct spdk_blob_set_parent_ctx *)cb_arg;
+	struct spdk_blob *blob = ctx->blob;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Blob set parent snapshot open error %d\n", bserrno);
+		ctx->bserrno = bserrno;
+		spdk_blob_close(blob, bs_blob_set_parent_cleanup_finish, ctx);
+		return;
+	}
+
+	ctx->parent.blob = parent;
+
+	if (!spdk_blob_is_snapshot(parent)) {
+		SPDK_ERRLOG("Parent blob is not a snapshot, cannot set parent\n");
+		ctx->bserrno = -EINVAL;
+		spdk_blob_close(blob, bs_blob_set_parent_close_parent, ctx);
+		return;
+	}
+
+	if (blob->use_extent_table != parent->use_extent_table) {
+		SPDK_ERRLOG("Parent blob extent table is different from child's one, cannot set parent\n");
+		ctx->bserrno = -EINVAL;
+		spdk_blob_close(blob, bs_blob_set_parent_close_parent, ctx);
+		return;
+	}
+
+	if (blob->active.num_clusters != parent->active.num_clusters) {
+		SPDK_ERRLOG("Parent blob has number of clusters different from child's one, cannot set parent\n");
+		ctx->bserrno = -EINVAL;
+		spdk_blob_close(blob, bs_blob_set_parent_close_parent, ctx);
+		return;
+	}
+
+	if (blob->locked_operation_in_progress) {
+		SPDK_DEBUGLOG(blob, "Cannot set parent of blob - another operation in progress\n");
+		ctx->bserrno = -EBUSY;
+		spdk_blob_close(blob, bs_blob_set_parent_close_parent, ctx);
+		return;
+	}
+
+	blob->locked_operation_in_progress = true;
+
+	/* Temporarily override md_ro flag for MD modification */
+	blob->md_ro = false;
+
+	bserrno = blob_set_xattr(blob, BLOB_SNAPSHOT, &parent->id, sizeof(spdk_blob_id), true);
+	if (bserrno != 0) {
+		blob->locked_operation_in_progress = false;
+		ctx->bserrno = bserrno;
+		spdk_blob_close(blob, bs_blob_set_parent_close_parent, ctx);
+		return;
+	}
+
+	bs_blob_list_remove(blob);
+	blob->parent_id = parent->id;
+
+	blob_back_bs_destroy(blob);
+	blob->back_bs_dev = bs_create_blob_bs_dev(parent);
+	bs_blob_list_add(blob);
+
+	spdk_blob_sync_md(blob, bs_blob_set_parent_close_blob, ctx);
+
+}
+
+static void
+bs_blob_set_parent_blob_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	struct spdk_blob_set_parent_ctx *ctx = (struct spdk_blob_set_parent_ctx *)cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Blob set parent blob open error %d\n", bserrno);
+		ctx->bserrno = bserrno;
+		spdk_blob_close(blob, bs_blob_set_parent_cleanup_finish, ctx);
+		return;
+	}
+
+	if (!spdk_blob_is_thin_provisioned(blob)) {
+		SPDK_ERRLOG("Child blob is not thin provisioned, cannot set parent\n");
+		ctx->bserrno = -EINVAL;
+		spdk_blob_close(blob, bs_blob_set_parent_cleanup_finish, ctx);
+		return;
+	}
+
+	if (spdk_blob_get_parent_snapshot(ctx->bs, blob->id) != SPDK_BLOBID_INVALID) {
+		SPDK_ERRLOG("Child blob has already a parent snapshot, cannot set parent\n");
+		ctx->bserrno = -EINVAL;
+		spdk_blob_close(blob, bs_blob_set_parent_cleanup_finish, ctx);
+		return;
+	}
+
+	ctx->blob = blob;
+
+	spdk_bs_open_blob(ctx->bs, ctx->parent.id, bs_blob_set_parent_snapshot_open_cpl, ctx);
+}
+
+void
+spdk_bs_blob_set_parent(struct spdk_blob_store *bs, spdk_blob_id blob_id,
+			spdk_blob_id snapshot_id, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob_set_parent_ctx *ctx;
+
+	if (spdk_blob_get_parent_snapshot(bs, blob_id) == snapshot_id) {
+		SPDK_NOTICELOG("Snapshot is already parent of blob\n");
+		cb_fn(cb_arg, 0);
+		return;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->bs = bs;
+	ctx->parent.id = snapshot_id;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->bserrno = 0;
+
+	spdk_bs_open_blob(bs, blob_id, bs_blob_set_parent_blob_open_cpl, ctx);
+}
+/* END spdk_bs_blob_set_parent */
+
 /* START spdk_blob_resize */
 struct spdk_bs_resize_ctx {
 	spdk_blob_op_complete cb_fn;

@@ -8702,6 +8702,116 @@ blob_shallow_copy(void)
 }
 
 static void
+blob_set_parent(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob1, *blob2, *snapshot;
+	spdk_blob_id blobid1, blobid2, snapshotid1, snapshotid2;
+
+	ut_spdk_blob_opts_init(&opts);
+
+	/* Create not thin provisioned blob */
+	opts.thin_provision = false;
+	opts.num_clusters = 2;
+	blob1 = ut_blob_create_and_open(bs, &opts);
+	blobid1 = spdk_blob_get_id(blob1);
+
+	/* Create another blob and make a snapshot */
+	opts.num_clusters = 2;
+	blob2 = ut_blob_create_and_open(bs, &opts);
+	blobid2 = spdk_blob_get_id(blob2);
+
+	CU_ASSERT_EQUAL(_get_snapshots_count(bs), 0);
+	spdk_bs_create_snapshot(bs, blobid2, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blobid != SPDK_BLOBID_INVALID);
+	CU_ASSERT_EQUAL(_get_snapshots_count(bs), 1);
+	snapshotid2 = g_blobid;
+
+	/* Set parent, test that child must be thin provisioned */
+	spdk_bs_blob_set_parent(bs, blobid1, snapshotid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+
+	ut_blob_close_and_delete(bs, blob1);
+
+	/* Create thin provisioned blob */
+	opts.thin_provision = true;
+	opts.num_clusters = 3;
+	blob1 = ut_blob_create_and_open(bs, &opts);
+	blobid1 = spdk_blob_get_id(blob1);
+
+	/* Set parent, test that child and parent must have same size */
+	spdk_bs_blob_set_parent(bs, blobid1, snapshotid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+
+	/* Set parent, test that child must not have snaphots */
+	spdk_bs_create_snapshot(bs, blobid1, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blobid != SPDK_BLOBID_INVALID);
+	CU_ASSERT_EQUAL(_get_snapshots_count(bs), 2);
+	snapshotid1 = g_blobid;
+
+	spdk_bs_blob_set_parent(bs, blobid1, snapshotid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+
+	ut_blob_close_and_delete(bs, blob2);
+	spdk_bs_delete_blob(bs, snapshotid1, blob_op_complete, NULL);
+	spdk_bs_delete_blob(bs, snapshotid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Create blob2 with the same size as blob1 and make a snapshot */
+	opts.num_clusters = 3;
+	blob2 = ut_blob_create_and_open(bs, &opts);
+	blobid2 = spdk_blob_get_id(blob2);
+
+	CU_ASSERT_EQUAL(_get_snapshots_count(bs), 0);
+	spdk_bs_create_snapshot(bs, blobid2, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blobid != SPDK_BLOBID_INVALID);
+	CU_ASSERT_EQUAL(_get_snapshots_count(bs), 1);
+	snapshotid2 = g_blobid;
+
+	spdk_bs_open_blob(bs, snapshotid2, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snapshot = g_blob;
+	CU_ASSERT(snapshot->data_ro == true);
+	CU_ASSERT(snapshot->md_ro == true);
+
+	CU_ASSERT_EQUAL(spdk_blob_get_parent_snapshot(bs, blobid2), snapshotid2);
+	CU_ASSERT_EQUAL(spdk_blob_get_parent_snapshot(bs, blobid1), SPDK_BLOBID_INVALID);
+
+	/* Set parent, test successful and also a double operations (with a resize) */
+	spdk_bs_blob_set_parent(bs, blobid1, snapshotid2, blob_op_complete, NULL);
+	spdk_blob_resize(blob1, 5, blob_op_complete, NULL);
+	CU_ASSERT(g_bserrno == -EBUSY);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Set parent again, with a snapshot already parent of blob */
+	spdk_bs_blob_set_parent(bs, blobid1, snapshotid2, blob_op_complete, NULL);
+	CU_ASSERT(g_bserrno == 0);
+
+	CU_ASSERT_EQUAL(spdk_blob_get_parent_snapshot(bs, blobid2), snapshotid2);
+	CU_ASSERT_EQUAL(spdk_blob_get_parent_snapshot(bs, blobid1), snapshotid2);
+
+	ut_blob_close_and_delete(bs, blob1);
+	ut_blob_close_and_delete(bs, blob2);
+	spdk_bs_delete_blob(bs, snapshotid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
+static void
 suite_bs_setup(void)
 {
 	struct spdk_bs_dev *dev;
@@ -8914,6 +9024,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite_esnap_bs, blob_esnap_hotplug);
 	CU_ADD_TEST(suite_blob, blob_is_degraded);
 	CU_ADD_TEST(suite_bs, blob_shallow_copy);
+	CU_ADD_TEST(suite_bs, blob_set_parent);
 
 	allocate_threads(2);
 	set_thread(0);
