@@ -543,6 +543,61 @@ function test_delete_snapshot_with_snapshot() {
 	check_leftover_devices
 }
 
+function test_lvol_set_parent() {
+	malloc_name=$(rpc_cmd bdev_malloc_create $MALLOC_SIZE_MB $MALLOC_BS)
+	lvs_uuid=$(rpc_cmd bdev_lvol_create_lvstore "$malloc_name" lvs_test)
+
+	# Calculate size and create two lvol bdev
+	lvol_size_mb=$(round_down $((LVS_DEFAULT_CAPACITY_MB / 6)))
+	lvol_size=$((lvol_size_mb * 1024 * 1024))
+
+	lvol1_uuid=$(rpc_cmd bdev_lvol_create -t -u "$lvs_uuid" lvol1 "$lvol_size_mb")
+	lvol1=$(rpc_cmd bdev_get_bdevs -b "$lvol1_uuid")
+
+	lvol2_uuid=$(rpc_cmd bdev_lvol_create -u "$lvs_uuid" lvol2 "$lvol_size_mb")
+	lvol2=$(rpc_cmd bdev_get_bdevs -b "$lvol2_uuid")
+
+	# Perform write operation to lvol1
+	# Change first half of its space
+	# Calculate md5sum of first half
+	nbd_start_disks "$DEFAULT_RPC_ADDR" "$lvol1_uuid" /dev/nbd1
+	fill_size=$((lvol_size / 2))
+	run_fio_test /dev/nbd1 0 $fill_size "write" "0xaa"
+	md5_1=$(head -c $fill_size /dev/nbd1 | md5sum)
+
+	# Perform write operation to lvol2
+	# Change second half of its space
+	nbd_start_disks "$DEFAULT_RPC_ADDR" "$lvol2_uuid" /dev/nbd2
+	run_fio_test /dev/nbd2 $fill_size $fill_size "write" "0xbb"
+	md5_2=$(tail -c $fill_size /dev/nbd2 | md5sum)
+	nbd_stop_disks "$DEFAULT_RPC_ADDR" /dev/nbd2
+
+	# Create snapshots of lvol2 bdev
+	snapshot_uuid=$(rpc_cmd bdev_lvol_snapshot lvs_test/lvol2 lvol_snapshot)
+
+	# Set snapshot as parent of lvol1
+	rpc_cmd bdev_lvol_set_parent "$lvol1_uuid" "$snapshot_uuid"
+
+	# Delete lvol2, it was create donly to have snapshot
+	rpc_cmd bdev_lvol_delete "$lvol2_uuid"
+
+	# Check that first half space of lvol1 remained the same
+	md5_check=$(head -c $fill_size /dev/nbd1 | md5sum)
+	[[ $md5_1 == "$md5_check" ]]
+
+	# Check that second half space of lvol1 comes from snapshot
+	md5_check=$(tail -c $fill_size /dev/nbd1 | md5sum)
+	[[ $md5_2 == "$md5_check" ]]
+
+	# Clean up
+	nbd_stop_disks "$DEFAULT_RPC_ADDR" /dev/nbd1
+	rpc_cmd bdev_lvol_delete "$lvol1_uuid"
+	rpc_cmd bdev_lvol_delete "$snapshot_uuid"
+	rpc_cmd bdev_lvol_delete_lvstore -u "$lvs_uuid"
+	rpc_cmd bdev_malloc_delete "$malloc_name"
+	check_leftover_devices
+}
+
 # Test for destroying lvol bdevs in particular order.
 function test_bdev_lvol_delete_ordering() {
 	local snapshot_name=snapshot snapshot_uuid
@@ -615,6 +670,7 @@ run_test "test_lvol_bdev_readonly" test_lvol_bdev_readonly
 run_test "test_delete_snapshot_with_clone" test_delete_snapshot_with_clone
 run_test "test_delete_snapshot_with_snapshot" test_delete_snapshot_with_snapshot
 run_test "test_bdev_lvol_delete_ordering" test_bdev_lvol_delete_ordering
+run_test "test_lvol_set_parent" test_lvol_set_parent
 
 trap - SIGINT SIGTERM EXIT
 killprocess $spdk_pid

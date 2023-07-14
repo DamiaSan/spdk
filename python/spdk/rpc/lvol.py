@@ -249,6 +249,20 @@ def bdev_lvol_shallow_copy_status(client, src_lvol_name):
     return client.call('bdev_lvol_shallow_copy_status', params)
 
 
+def bdev_lvol_set_parent(client, lvol_name, snapshot_name):
+    """Set parent snapshot of lvol
+
+    Args:
+        lvol_name: name of lvol to set parent of
+        snapshot_name: name of the snapshot to become parent of lvol
+    """
+    params = {
+        'lvol_name': lvol_name,
+        'snapshot_name': snapshot_name
+    }
+    return client.call('bdev_lvol_set_parent', params)
+
+
 def bdev_lvol_delete_lvstore(client, uuid=None, lvs_name=None):
     """Destroy a logical volume store.
 
