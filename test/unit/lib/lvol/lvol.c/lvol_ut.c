@@ -51,6 +51,7 @@ struct spdk_blob {
 	char			name[SPDK_LVS_NAME_MAX];
 	bool			thin_provisioned;
 	struct spdk_bs_dev	*back_bs_dev;
+	uint64_t		num_clusters;
 };
 
 int g_lvserrno;
@@ -60,6 +61,7 @@ int g_inflate_rc;
 int g_remove_rc;
 bool g_lvs_rename_blob_open_error = false;
 bool g_blob_read_only = false;
+bool g_blob_is_snapshot = false;
 struct spdk_lvol_store *g_lvol_store;
 struct spdk_lvol *g_lvol;
 spdk_blob_id g_blobid = 1;
@@ -137,7 +139,7 @@ spdk_bs_iter_first(struct spdk_blob_store *bs,
 uint64_t
 spdk_blob_get_num_clusters(struct spdk_blob *blob)
 {
-	return 1;
+	return blob->num_clusters;
 }
 
 void
@@ -248,10 +250,23 @@ spdk_blob_is_thin_provisioned(struct spdk_blob *blob)
 	return blob->thin_provisioned;
 }
 
+bool
+spdk_blob_is_snapshot(struct spdk_blob *blob)
+{
+	return g_blob_is_snapshot;
+}
+
 void
 spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 			  spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
 			  spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, 0);
+}
+
+void
+spdk_bs_blob_set_local_parent(struct spdk_blob_store *bs, spdk_blob_id blob_id,
+			      spdk_blob_id snapshot_id, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	cb_fn(cb_arg, 0);
 }
@@ -498,6 +513,12 @@ spdk_bs_create_blob_ext(struct spdk_blob_store *bs, const struct spdk_blob_opts 
 		b->thin_provisioned = true;
 	}
 	b->bs = bs;
+
+	if (opts != NULL) {
+		b->num_clusters = opts->num_clusters;
+	} else {
+		b->num_clusters = 1;
+	}
 
 	TAILQ_INSERT_TAIL(&bs->blobs, b, link);
 	cb_fn(cb_arg, b->id, 0);
@@ -3382,6 +3403,146 @@ lvol_shallow_copy(void)
 	CU_ASSERT(g_io_channel == NULL);
 }
 
+static void
+lvol_set_local_parent(void)
+{
+	struct lvol_ut_bs_dev bs_dev;
+	struct spdk_bdev esnap_bdev;
+	struct spdk_lvol *lvol1, *lvol2, *lvol3, *lvol4, *snapshot;
+	struct spdk_lvs_opts opts;
+	char uuid_str[SPDK_UUID_STRING_LEN];
+	uint64_t cluster_sz = BS_CLUSTER_SIZE;
+	int rc = 0;
+
+	init_dev(&bs_dev);
+	init_dev(&g_esnap_dev);
+
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+	opts.esnap_bs_dev_create = ut_esnap_bs_dev_create;
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&bs_dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	/* Create lvol1, clone of an esnap */
+	g_lvserrno = 0xbad;
+	init_bdev(&esnap_bdev, "bdev1", BS_CLUSTER_SIZE);
+	CU_ASSERT(spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), &esnap_bdev.uuid) == 0);
+	MOCK_SET(spdk_bdev_get_by_name, &esnap_bdev);
+	rc = spdk_lvol_create_esnap_clone(uuid_str, strlen(uuid_str), cluster_sz, g_lvol_store,
+					  "lvol1", lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	MOCK_CLEAR(spdk_bdev_get_by_name);
+
+	lvol1 = g_lvol;
+
+	/* Create lvol2 to make afterwards a snapshot */
+	spdk_lvol_create(g_lvol_store, "lvol2", cluster_sz, true, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	lvol2 = g_lvol;
+
+	/* Create lvol3, a lvol that is not an esnap clone  */
+	spdk_lvol_create(g_lvol_store, "lvol3", 10, false, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	lvol3 = g_lvol;
+
+	/* Create lvol4, an esnap clone with different size respect to lvol2 */
+	g_lvserrno = 0xbad;
+	init_bdev(&esnap_bdev, "bdev1", BS_CLUSTER_SIZE);
+	CU_ASSERT(spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), &esnap_bdev.uuid) == 0);
+	MOCK_SET(spdk_bdev_get_by_name, &esnap_bdev);
+	rc = spdk_lvol_create_esnap_clone(uuid_str, strlen(uuid_str), 2 * cluster_sz, g_lvol_store,
+					  "lvol4", lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	MOCK_CLEAR(spdk_bdev_get_by_name);
+
+	lvol4 = g_lvol;
+
+	/* Create a snapshot of lvol2 */
+	spdk_lvol_create_snapshot(lvol2, "snap", lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	CU_ASSERT_STRING_EQUAL(g_lvol->name, "snap");
+
+	snapshot = g_lvol;
+
+	/* Set local parent with a NULL lvol */
+	g_lvserrno = 0;
+	spdk_lvol_set_local_parent(NULL, snapshot, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == -ENODEV);
+
+	/* Set local parent with a NULL snapshot */
+	g_lvserrno = 0;
+	spdk_lvol_set_local_parent(lvol1, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == -ENODEV);
+
+	/* Set local parent with a not esnap clone lvol */
+	g_lvserrno = 0;
+	MOCK_SET(spdk_blob_is_esnap_clone, false);
+	spdk_lvol_set_local_parent(lvol3, snapshot, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == -EPERM);
+	MOCK_CLEAR(spdk_blob_is_esnap_clone);
+
+	/* Set local parent with a not snapshot lvol */
+	g_blob_is_snapshot = false;
+	g_lvserrno = 0;
+	MOCK_SET(spdk_blob_is_esnap_clone, true);
+	spdk_lvol_set_local_parent(lvol1, snapshot, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == -EPERM);
+	MOCK_CLEAR(spdk_blob_is_esnap_clone);
+
+	/* Set local parent with lvol and snapshot of different size */
+	g_blob_is_snapshot = true;
+	g_lvserrno = 0;
+	spdk_lvol_set_local_parent(lvol4, snapshot, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == -EFBIG);
+
+	/* Set local parent successful */
+	g_blob_is_snapshot = true;
+	g_lvserrno = -1;
+	spdk_lvol_set_local_parent(lvol1, snapshot, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Clean up */
+	spdk_lvol_close(lvol1, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	spdk_lvol_close(lvol2, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	spdk_lvol_close(lvol3, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	spdk_lvol_close(lvol4, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	spdk_lvol_close(snapshot, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&bs_dev);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3429,6 +3590,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_esnap_hotplug);
 	CU_ADD_TEST(suite, lvol_get_by);
 	CU_ADD_TEST(suite, lvol_shallow_copy);
+	CU_ADD_TEST(suite, lvol_set_local_parent);
 
 	allocate_threads(1);
 	set_thread(0);
