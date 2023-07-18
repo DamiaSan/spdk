@@ -8702,6 +8702,102 @@ blob_shallow_copy(void)
 }
 
 static void
+blob_set_local_parent(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct ut_esnap_opts esnap_opts;
+	struct spdk_blob *blob1, *blob2;
+	spdk_blob_id blobid1, blobid2, snapshotid1, snapshotid2, snapshotid3;
+	uint32_t cluster_sz, block_sz;
+	const uint32_t esnap_num_clusters = 4;
+	uint64_t esnap_num_blocks;
+
+	cluster_sz = spdk_bs_get_cluster_size(bs);
+	block_sz = spdk_bs_get_io_unit_size(bs);
+	esnap_num_blocks = cluster_sz * esnap_num_clusters / block_sz;
+
+	/* Create a normal blob and make a couple of snapshots */
+	ut_spdk_blob_opts_init(&opts);
+	blob1 = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(blob1 != NULL);
+	blobid1 = spdk_blob_get_id(blob1);
+	spdk_bs_create_snapshot(bs, blobid1, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snapshotid1 = g_blobid;
+	spdk_bs_create_snapshot(bs, blobid1, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snapshotid2 = g_blobid;
+
+	/* Call set_local_parent with a blob and its parent snapshot */
+	spdk_bs_blob_set_local_parent(bs, blobid1, snapshotid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Create an esnap clone blob */
+	ut_spdk_blob_opts_init(&opts);
+	ut_esnap_opts_init(block_sz, esnap_num_blocks, __func__, NULL, &esnap_opts);
+	opts.esnap_id = &esnap_opts;
+	opts.esnap_id_len = sizeof(esnap_opts);
+	opts.num_clusters = esnap_num_clusters;
+	blob2 = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(blob2 != NULL);
+	blobid2 = spdk_blob_get_id(blob2);
+
+	/* Call set_local_parent with a non esnap clone blob */
+	spdk_bs_blob_set_local_parent(bs, blobid1, snapshotid1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+
+	/* Call set_local_parent with a non snapshot parent */
+	spdk_bs_blob_set_local_parent(bs, blobid2, blobid1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+
+	/* Call set_local_parent with blob and snapshot of different size */
+	spdk_bs_blob_set_local_parent(bs, blobid2, snapshotid1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+
+	/* Resize blob to esnap size and make a snapshot */
+	spdk_blob_resize(blob1, esnap_num_clusters, blob_op_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_bserrno == 0);
+	spdk_bs_create_snapshot(bs, blobid1, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snapshotid3 = g_blobid;
+
+	/* Call set_local_parent correctly */
+	spdk_bs_blob_set_local_parent(bs, blobid2, snapshotid3, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* Check relations */
+	CU_ASSERT(!spdk_blob_is_esnap_clone(blob2));
+	CU_ASSERT(spdk_blob_is_clone(blob2));
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid2) == snapshotid3);
+
+	/* Clean up */
+	ut_blob_close_and_delete(bs, blob2);
+	ut_blob_close_and_delete(bs, blob1);
+	spdk_bs_delete_blob(bs, snapshotid3, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_delete_blob(bs, snapshotid2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_delete_blob(bs, snapshotid1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
+static void
 suite_bs_setup(void)
 {
 	struct spdk_bs_dev *dev;
@@ -8914,6 +9010,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite_esnap_bs, blob_esnap_hotplug);
 	CU_ADD_TEST(suite_blob, blob_is_degraded);
 	CU_ADD_TEST(suite_bs, blob_shallow_copy);
+	CU_ADD_TEST(suite_esnap_bs, blob_set_local_parent);
 
 	allocate_threads(2);
 	set_thread(0);

@@ -816,6 +816,22 @@ void spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channe
 			       spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
 			       spdk_blob_op_complete cb_fn, void *cb_arg);
 
+/**
+ * Change the parent of a blob from an external snapshot to a local one.
+ *
+ * This call change the parent of a blob, that is a clone of an external snapshot,
+ * to make it a clone of a standard snapshot.
+ * Blob and snapshot must have same dimensions.
+ *
+ * \param bs blobstore.
+ * \param blob_id The id of the blob.
+ * \param snapshot_id The id of the snapshot.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_blob_set_local_parent(struct spdk_blob_store *bs, spdk_blob_id blob_id,
+				   spdk_blob_id snapshot_id, spdk_blob_op_complete cb_fn, void *cb_arg);
+
 
 struct spdk_blob_open_opts {
 	enum blob_clear_method  clear_method;
