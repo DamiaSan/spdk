@@ -496,6 +496,7 @@ Example response:
     "bdev_lvol_rename_lvstore",
     "bdev_lvol_create_lvstore",
     "bdev_lvol_shallow_copy",
+    "bdev_lvol_set_local_parent",
     "bdev_daos_delete",
     "bdev_daos_create",
     "bdev_daos_resize"
@@ -10081,6 +10082,45 @@ Example response:
     "state": "in progress",
     "progress": "2/4"
   }
+}
+~~~
+
+### bdev_lvol_set_local_parent {#rpc_bdev_lvol_set_local_parent}
+
+Change the parent of a lvol from an external snapshot to a local one.
+Lvol must be a clone of an external snapshot and will become a clone of the given standard snaphot.
+Lvol and snapshot must have the same size.
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+lvol_name               | Required | string      | Name of the lvol to set parent of
+snapshot_name           | Required | string      | Name of the snapshot to become parent of lvol
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_lvol_set_local_parent",
+  "id": 1,
+  "params": {
+    "lvol_name": "LVOL0",
+    "snapshot_name": "SNAP0"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
 }
 ~~~
 
