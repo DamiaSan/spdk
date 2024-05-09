@@ -502,6 +502,45 @@ def bdev_raid_grow_base_bdev(client, raid_name, base_name):
     return client.call('bdev_raid_grow_base_bdev', params)
 
 
+def bdev_raid_get_base_bdev_delta_map(client, base_bdev_name):
+    """Get the delta bitmap of a faulty base bdev
+
+    Args:
+        base_bdev_name: base bdev name
+
+    Returns:
+        None
+    """
+    params = {'base_bdev_name': base_bdev_name}
+    return client.call('bdev_raid_get_base_bdev_delta_map', params)
+
+
+def bdev_raid_stop_base_bdev_delta_map(client, base_bdev_name):
+    """Stop the updating of the delta bitmap of a faulty base bdev
+
+    Args:
+        base_bdev_name: base bdev name
+
+    Returns:
+        None
+    """
+    params = {'base_bdev_name': base_bdev_name}
+    return client.call('bdev_raid_stop_base_bdev_delta_map', params)
+
+
+def bdev_raid_clear_base_bdev_faulty_state(client, base_bdev_name):
+    """Clear the faulty state of a base bdev
+
+    Args:
+        base_bdev_name: base bdev name
+
+    Returns:
+        None
+    """
+    params = {'base_bdev_name': base_bdev_name}
+    return client.call('bdev_raid_clear_base_bdev_faulty_state', params)
+
+
 def bdev_aio_create(client, filename, name, block_size=None, readonly=False):
     """Construct a Linux AIO block device.
 

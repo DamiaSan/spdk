@@ -18,6 +18,28 @@ struct raid1_io_channel {
 	uint64_t *read_blocks_outstanding;
 };
 
+static void raid1_write_bdev_faulty(struct raid_bdev_io *raid_io, struct raid_base_bdev_info *base_info)
+{
+	struct raid_bdev_io_failed *io_failed;
+
+	if (base_info->state == BASE_BDEV_STATE_FAULTY) {
+		io_failed = calloc(1, sizeof(*io_failed));
+		if (io_failed == NULL) {
+			SPDK_ERRLOG("Error allocating io_failed struct\n");
+			spdk_thread_send_msg(spdk_thread_get_app_thread(),
+					     _raid_bdev_base_bdev_clear_faulty_state_msg,
+					     base_info);
+		} else {
+			io_failed->base_info = base_info;
+			io_failed->offset_blocks = raid_io->offset_blocks;
+			io_failed->num_blocks = raid_io->num_blocks;
+			spdk_thread_send_msg(spdk_thread_get_app_thread(),
+					     raid_bdev_base_bdev_delta_map_update,
+					     io_failed);
+		}
+	}
+}
+
 static void
 raid1_channel_inc_read_counters(struct raid_bdev_io_channel *raid_ch, uint8_t idx,
 				uint64_t num_blocks)
@@ -52,6 +74,21 @@ static void
 raid1_write_bdev_io_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct raid_bdev_io *raid_io = cb_arg;
+	struct raid_base_bdev_info *base_info;
+
+	if (!success) {
+
+		/* Find the raid_bdev which has claimed this base_bdev */
+		base_info = raid_bdev_find_base_info_by_bdev(bdev_io->bdev);
+		if (!base_info) {
+			SPDK_ERRLOG("Error getting base info from bdev %s\n", bdev_io->bdev->name);
+			spdk_thread_send_msg(spdk_thread_get_app_thread(),
+					_raid_bdev_base_bdev_clear_faulty_state_msg,
+					base_info);
+		} else {
+			raid1_write_bdev_faulty(raid_io, base_info);
+		}
+	}
 
 	raid1_bdev_io_completion(bdev_io, success, raid_io);
 }
@@ -182,6 +219,9 @@ raid1_submit_write_request(struct raid_bdev_io *raid_io)
 		base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, idx);
 
 		if (base_ch == NULL) {
+			/* If the base bdev is in faulty state, must send a message to update the bitmap */
+			raid1_write_bdev_faulty(raid_io, base_info);
+
 			/* skip a missing base bdev's slot */
 			raid_io->base_bdev_io_submitted++;
 			raid_bdev_io_complete_part(raid_io, 1, SPDK_BDEV_IO_STATUS_SUCCESS);
@@ -197,6 +237,8 @@ raid1_submit_write_request(struct raid_bdev_io *raid_io)
 							base_ch, _raid1_submit_rw_request);
 				return 0;
 			}
+
+			raid1_write_bdev_faulty(raid_io, base_info);
 
 			base_bdev_io_not_submitted = raid_bdev->num_base_bdevs -
 						     raid_io->base_bdev_io_submitted;
@@ -365,7 +407,9 @@ static int
 raid1_start(struct raid_bdev *raid_bdev)
 {
 	uint64_t min_blockcnt = UINT64_MAX;
+	uint32_t min_optimal_io_boundary = UINT32_MAX;
 	struct raid_base_bdev_info *base_info;
+	struct spdk_bdev *bdev;
 	struct raid1_info *r1info;
 	char name[256];
 
@@ -378,6 +422,11 @@ raid1_start(struct raid_bdev *raid_bdev)
 
 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
 		min_blockcnt = spdk_min(min_blockcnt, base_info->data_size);
+
+		if (base_info->desc != NULL) {
+			bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+			min_optimal_io_boundary = spdk_min(min_optimal_io_boundary, bdev->optimal_io_boundary);
+		}
 	}
 
 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
@@ -385,6 +434,7 @@ raid1_start(struct raid_bdev *raid_bdev)
 	}
 
 	raid_bdev->bdev.blockcnt = min_blockcnt;
+	raid_bdev->bdev.optimal_io_boundary = min_optimal_io_boundary;
 	raid_bdev->module_private = r1info;
 
 	snprintf(name, sizeof(name), "raid1_%s", raid_bdev->bdev.name);
@@ -517,6 +567,7 @@ static struct raid_bdev_module g_raid1_module = {
 	.base_bdevs_min = 1,
 	.base_bdevs_constraint = {CONSTRAINT_MIN_BASE_BDEVS_OPERATIONAL, 1},
 	.memory_domains_supported = true,
+	.delta_map_supported = true,
 	.start = raid1_start,
 	.stop = raid1_stop,
 	.submit_rw_request = raid1_submit_rw_request,

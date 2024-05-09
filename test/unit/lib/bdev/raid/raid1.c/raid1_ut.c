@@ -51,6 +51,21 @@ DEFINE_STUB(spdk_bdev_unmap_blocks, int, (struct spdk_bdev_desc *desc,
 		uint64_t offset_blocks, uint64_t num_blocks,
 		spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 
+void
+raid_bdev_base_bdev_delta_map_update(void *ctx)
+{
+}
+
+void
+_raid_bdev_base_bdev_clear_faulty_state_msg(void *ctx)
+{
+}
+
+struct raid_base_bdev_info *raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev)
+{
+	return NULL;
+}
+
 static int
 test_setup(void)
 {

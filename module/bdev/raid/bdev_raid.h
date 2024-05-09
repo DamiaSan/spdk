@@ -43,6 +43,23 @@ enum raid_bdev_state {
 	RAID_BDEV_STATE_MAX
 };
 
+/* The state of a base bdev */
+enum base_bdev_state {
+	BASE_BDEV_STATE_NONE,
+
+	/* 
+	 * Base bdev triggered a remove event, the faulty timer is running and the delta bitmap
+	 * is being updated
+	 */
+	BASE_BDEV_STATE_FAULTY,
+
+	/* 
+	 * Base bdev triggered a remove event, the faulty timer is running but the updating of
+	 * delta bitmap is stopped
+	 */
+	BASE_BDEV_STATE_FAULTY_STOPPED
+};
+
 enum raid_process_type {
 	RAID_PROCESS_NONE,
 	RAID_PROCESS_REBUILD,
@@ -108,6 +125,26 @@ struct raid_base_bdev_info {
 
 	/* Set to true to skip the start of the rebuild process when adding to an online raid */
 	bool			skip_rebuild;
+
+	/* The state of the base bdev */
+	enum base_bdev_state	state;
+
+	/* 
+	 * When the base bdev is in faulty state, this map records all the regions that have
+	 * been modified by a write operation. Region size is equal to bdev optimal_io_boundary.
+	 * Delta map can be retrieved with a RPC to speed up the rebuild of the base bdev in case
+	 * it come back online before being declared definitely dead and delta_map deleted.
+	 */
+	struct spdk_bit_array	*delta_map;
+
+	/* The poller starts when the base bdev becomes faulty and delta_map is created.
+	 * When the poller expires, base bdev is definitely removed from the raid and
+	 * delta map deleted.
+	 */
+	struct spdk_poller	*poller;
+
+	/* The ticks passed when the poller started */
+	uint64_t 		poller_start_ticks;
 };
 
 struct raid_bdev_io;
@@ -273,6 +310,13 @@ int raid_bdev_attach_base_bdev(struct raid_bdev *raid_bdev, struct spdk_bdev *ba
 			       raid_base_bdev_cb cb_fn, void *cb_ctx);
 int raid_bdev_grow_base_bdev(struct raid_bdev *raid_bdev, char *base_bdev_name,
 			     raid_bdev_destruct_cb cb_fn, void *cb_arg);
+struct raid_base_bdev_info *raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev);
+struct raid_base_bdev_info *raid_bdev_find_faulty_base_info_by_name(char *base_bdev_name);
+struct spdk_bit_array *raid_bdev_get_base_bdev_delta_map(char *base_bdev_name);
+bool raid_bdev_stop_base_bdev_delta_map(char *base_bdev_name);
+bool raid_bdev_clear_base_bdev_faulty_state(char *base_bdev_name);
+uint64_t raid_bdev_region_size_base_bdev_delta_map(char *base_bdev_name);
+const char *raid_bdev_delta_map_state(enum base_bdev_state value);
 
 /*
  * RAID module descriptor
@@ -299,6 +343,9 @@ struct raid_bdev_module {
 
 	/* Set to true if this module supports memory domains. */
 	bool memory_domains_supported;
+
+	/* Se to true if this module supports the recording of a delta_map for faulty base bdev */
+	bool delta_map_supported;
 
 	/*
 	 * Called when the raid is starting, right before changing the state to
@@ -376,6 +423,16 @@ void raid_bdev_io_init(struct raid_bdev_io *raid_io, struct raid_bdev_io_channel
 		       enum spdk_bdev_io_type type, uint64_t offset_blocks,
 		       uint64_t num_blocks, struct iovec *iovs, int iovcnt, void *md_buf,
 		       struct spdk_memory_domain *memory_domain, void *memory_domain_ctx);
+
+/* RAID delta map update message and data */
+struct raid_bdev_io_failed {
+	struct raid_base_bdev_info *base_info;
+	uint64_t offset_blocks;
+	uint64_t num_blocks;
+};
+
+void raid_bdev_base_bdev_delta_map_update(void *ctx);
+void _raid_bdev_base_bdev_clear_faulty_state_msg(void *ctx);
 
 static inline uint8_t
 raid_bdev_base_bdev_slot(struct raid_base_bdev_info *base_info)
