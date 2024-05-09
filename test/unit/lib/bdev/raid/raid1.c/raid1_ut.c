@@ -69,6 +69,21 @@ raid_bdev_fail_base_bdev(struct raid_base_bdev_info *base_info)
 	base_info->is_failed = true;
 }
 
+void
+raid_bdev_base_bdev_delta_map_update(void *ctx)
+{
+}
+
+void
+_raid_bdev_base_bdev_clear_faulty_state_msg(void *ctx)
+{
+}
+
+struct raid_base_bdev_info *raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev)
+{
+	return NULL;
+}
+
 static int
 test_setup(void)
 {

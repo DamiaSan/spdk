@@ -10,6 +10,7 @@
 #include "spdk/string.h"
 #include "spdk/log.h"
 #include "spdk/env.h"
+#include "spdk/bit_array.h"
 
 #define RPC_MAX_BASE_BDEVS 255
 
@@ -771,3 +772,126 @@ cleanup:
 	free(ctx);
 }
 SPDK_RPC_REGISTER("bdev_raid_grow_base_bdev", rpc_bdev_raid_grow_base_bdev, SPDK_RPC_RUNTIME)
+
+/* delta map */
+
+/* Structure to decode the input parameters for delta map RPC methods. */
+static const struct spdk_json_object_decoder rpc_bdev_raid_base_bdev_delta_map_decoders[] = {
+	{"base_bdev_name", 0, spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_raid_get_base_bdev_delta_map(struct spdk_jsonrpc_request *request,
+				      const struct spdk_json_val *params)
+{
+	char *base_bdev_name = NULL;
+	struct spdk_json_write_ctx *w;
+	struct spdk_bit_array *delta_map;
+	char *encoded;
+	uint64_t region_size;
+	int rc;
+
+	rc = spdk_json_decode_object(params, rpc_bdev_raid_base_bdev_delta_map_decoders,
+				     SPDK_COUNTOF(rpc_bdev_raid_base_bdev_delta_map_decoders),
+				     &base_bdev_name);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	delta_map = raid_bdev_get_base_bdev_delta_map(base_bdev_name);
+	if (delta_map == NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		goto cleanup;
+	}
+
+	encoded = spdk_bit_array_to_base64_string(delta_map);
+	if (encoded == NULL) {
+		SPDK_ERRLOG("Failed to encode delta map to base64 string\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 spdk_strerror(ENOMEM));
+		goto cleanup;
+	}
+
+	region_size = raid_bdev_region_size_base_bdev_delta_map(base_bdev_name);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_uint64(w, "region_size", region_size);
+	spdk_json_write_named_string(w, "delta_map", encoded);
+
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+	free(encoded);
+
+cleanup:
+	free(base_bdev_name);
+}
+SPDK_RPC_REGISTER("bdev_raid_get_base_bdev_delta_map", rpc_bdev_raid_get_base_bdev_delta_map,
+		  SPDK_RPC_RUNTIME)
+
+static void
+rpc_bdev_raid_stop_base_bdev_delta_map(struct spdk_jsonrpc_request *request,
+				       const struct spdk_json_val *params)
+{
+	char *base_bdev_name = NULL;
+	int rc;
+	bool ret;
+
+	rc = spdk_json_decode_object(params, rpc_bdev_raid_base_bdev_delta_map_decoders,
+				     SPDK_COUNTOF(rpc_bdev_raid_base_bdev_delta_map_decoders),
+				     &base_bdev_name);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	ret = raid_bdev_stop_base_bdev_delta_map(base_bdev_name);
+	if (!ret) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		goto cleanup;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+cleanup:
+	free(base_bdev_name);
+}
+SPDK_RPC_REGISTER("bdev_raid_stop_base_bdev_delta_map", rpc_bdev_raid_stop_base_bdev_delta_map,
+		  SPDK_RPC_RUNTIME)
+
+static void
+rpc_bdev_raid_clear_base_bdev_faulty_state(struct spdk_jsonrpc_request *request,
+		const struct spdk_json_val *params)
+{
+	char *base_bdev_name = NULL;
+	int rc;
+	bool ret;
+
+	rc = spdk_json_decode_object(params, rpc_bdev_raid_base_bdev_delta_map_decoders,
+				     SPDK_COUNTOF(rpc_bdev_raid_base_bdev_delta_map_decoders),
+				     &base_bdev_name);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	ret = raid_bdev_clear_base_bdev_faulty_state(base_bdev_name);
+	if (!ret) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		goto cleanup;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+cleanup:
+	free(base_bdev_name);
+}
+SPDK_RPC_REGISTER("bdev_raid_clear_base_bdev_faulty_state",
+		  rpc_bdev_raid_clear_base_bdev_faulty_state, SPDK_RPC_RUNTIME)
