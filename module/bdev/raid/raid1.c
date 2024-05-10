@@ -33,7 +33,7 @@ static void raid1_write_bdev_faulty(struct raid_bdev_io *raid_io, struct raid_ba
 			io_failed->base_info = base_info;
 			io_failed->offset_blocks = raid_io->offset_blocks;
 			io_failed->num_blocks = raid_io->num_blocks;
-			spdk_thread_send_msg(spdk_thread_get_app_thread(),
+			spdk_thread_send_msg(base_info->delta_map_thread,
 					     raid_bdev_base_bdev_delta_map_update,
 					     io_failed);
 		}

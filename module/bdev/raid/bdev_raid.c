@@ -390,14 +390,7 @@ raid_bdev_cleanup(struct raid_bdev *raid_bdev)
 
 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
 		assert(base_info->desc == NULL);
-		free(base_info->name);
-		if (base_info->delta_map != NULL) {
-			spdk_bit_array_free(&base_info->delta_map);
-		}
-		if (base_info->poller != NULL) {
-			spdk_poller_unregister(&base_info->poller);
-		}
-		//TODO lo start_ctx in questo modo non viene disallocato
+		_raid_bdev_base_bdev_clear_faulty_state_msg(base_info);
 	}
 
 	TAILQ_REMOVE(&g_raid_bdev_list, raid_bdev, global_link);
@@ -2122,11 +2115,12 @@ raid_bdev_base_bdev_delta_map_update(void *ctx)
 	struct spdk_bdev *bdev;
 	uint32_t section_index, start_section, end_section;
 
-	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 	assert(io_failed != NULL);
 
 	base_info = io_failed->base_info;
 	bdev = &base_info->raid_bdev->bdev;
+
+	assert(spdk_get_thread() == base_info->delta_map_thread);
 
 	start_section = io_failed->offset_blocks / bdev->optimal_io_boundary;
 	end_section = (io_failed->offset_blocks + io_failed->num_blocks) /
@@ -2140,48 +2134,37 @@ raid_bdev_base_bdev_delta_map_update(void *ctx)
 }
 
 static void
-raid_bdev_channel_clear_faulty_state_done(struct spdk_io_channel_iter *i, int status)
+raid_bdev_base_bdev_delta_map_thread_stopped(void *arg)
 {
-	struct raid_base_bdev_info *base_info = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_bit_array *delta_map = arg;
 
-	if (base_info->delta_map != NULL) {
-		spdk_bit_array_free(&base_info->delta_map);
-	}
+	spdk_bit_array_free(&delta_map);
 }
 
 static void
-raid_bdev_channel_clear_faulty_state(struct spdk_io_channel_iter *i)
+raid_bdev_base_bdev_stop_delta_map_thread(void *arg)
 {
-	spdk_for_each_channel_continue(i, 0);
-}
-
-
-static void raid_bdev_clear_faulty_base_info(struct raid_base_bdev_info *base_info)
-{
-	base_info->state = BASE_BDEV_STATE_NONE;
-	free(base_info->name);
-	base_info->name = NULL;
-	spdk_bit_array_free(&base_info->delta_map);
-	spdk_poller_unregister(&base_info->poller);
+	spdk_thread_send_msg(spdk_thread_get_app_thread(), raid_bdev_base_bdev_delta_map_thread_stopped, arg);
+	spdk_thread_exit(spdk_get_thread());
 }
 
 static int
 _raid_bdev_base_bdev_clear_faulty_state(void *arg)
 {
 	struct raid_base_bdev_info *base_info = arg;
-	struct raid_bdev *raid_bdev;
 
 	assert(base_info != NULL);
 
-	raid_bdev = base_info->raid_bdev;
-
-	raid_bdev_clear_faulty_base_info(base_info);
-
-	/*
-	 * Now that I have clared the faulty state, I must ensure that no delta map update messages are ongoing.
-	 * So I make a round trip of all channels and at the end check again the delta map
-	 */
-	spdk_for_each_channel(raid_bdev, raid_bdev_channel_clear_faulty_state, base_info, raid_bdev_channel_clear_faulty_state_done);
+	base_info->state = BASE_BDEV_STATE_NONE;
+	free(base_info->name);
+	base_info->name = NULL;
+	if (base_info->delta_map != NULL) {
+		spdk_thread_send_msg(base_info->delta_map_thread, raid_bdev_base_bdev_stop_delta_map_thread, base_info->delta_map);
+		base_info->delta_map = NULL;
+	}
+	if (base_info->poller != NULL) {
+		spdk_poller_unregister(&base_info->poller);
+	}
 
 	return 0;
 }
@@ -2218,14 +2201,18 @@ static void raid_bdev_start_faulty_state(void *ctx, int status)
 {
 	struct raid_base_bdev_info *base_info = ctx;
 	struct spdk_bdev *bdev;
+	char thread_name[RAID_BDEV_SB_NAME_SIZE + 10];
 
 	assert(base_info != NULL);
 	bdev = &base_info->raid_bdev->bdev;
+
+	snprintf(thread_name, sizeof(thread_name), "%s_delta_map", base_info->name);
 
 	/* Delta map could already have been created by a message sent by an I/O thread upon a write failure */
 	if (base_info->delta_map == NULL) {
 		base_info->delta_map = spdk_bit_array_create(bdev->blockcnt / bdev->optimal_io_boundary);
 	}
+	base_info->delta_map_thread = spdk_thread_create(thread_name, NULL);
 
 	base_info->poller_start_ticks = spdk_get_ticks();
 	base_info->poller = SPDK_POLLER_REGISTER(_raid_bdev_base_bdev_clear_faulty_state_poller, base_info, 1000000);
@@ -2256,7 +2243,12 @@ struct spdk_bit_array *raid_bdev_get_base_bdev_delta_map(char *base_bdev_name)
 	base_info = raid_bdev_find_faulty_base_info_by_name(base_bdev_name);
 
 	if (!base_info) {
-		SPDK_ERRLOG("bdev '%s' not part of any RAID\n", base_bdev_name);
+		SPDK_ERRLOG("bdev '%s' not a faulty base badev\n", base_bdev_name);
+		return NULL;
+	}
+
+	if (base_info->state != BASE_BDEV_STATE_FAULTY_STOPPED) {
+		SPDK_ERRLOG("delta mamp can be retrieved when its updating is stopped\n");
 		return NULL;
 	}
 
@@ -3452,7 +3444,7 @@ raid_bdev_attach_base_bdev(struct raid_bdev *raid_bdev, struct spdk_bdev *base_b
 		}
 		/* Check if a faulty base bdev with the same name is present */
 		if (iter->state != BASE_BDEV_STATE_NONE && strcmp(iter->name, base_bdev->name) == 0) {
-			raid_bdev_clear_faulty_base_info(base_info);
+			_raid_bdev_base_bdev_clear_faulty_state(base_info);
 			base_info = iter;
 			break;
 		}
@@ -3705,7 +3697,7 @@ raid_bdev_grow_base_bdev_get_slot(struct raid_bdev *raid_bdev, char *base_bdev_n
 		}
 		/* Check if a faulty base bdev with the same name is present */
 		if (base_info->state != BASE_BDEV_STATE_NONE && strcmp(base_info->name, base_bdev_name) == 0) {
-			raid_bdev_clear_faulty_base_info(base_info);
+			_raid_bdev_base_bdev_clear_faulty_state(base_info);
 			break;
 		}
 	}

@@ -137,6 +137,9 @@ struct raid_base_bdev_info {
 	 */
 	struct spdk_bit_array	*delta_map;
 
+	/* The thread that will update the delta_map */
+	struct spdk_thread	*delta_map_thread;
+
 	/* The poller starts when the base bdev becomes faulty and delta_map is created.
 	 * When the poller expires, base bdev is definitely removed from the raid and
 	 * delta map deleted.
