@@ -43,20 +43,21 @@ enum raid_bdev_state {
 	RAID_BDEV_STATE_MAX
 };
 
-/* The state of a base bdev */
+/*
+ * The state of a base bdev
+ * When a bdev remove event or a base bdev fail message arrive to the raid, if delta map is enabled,
+ * the base bdev enter in faulty state for a defined timeout: the base bdev is removed from the
+ * raid but a delta bitmap is created and updated by every I/O write operations performed over the raid.
+ * Expired the timeout, the delta bitmap is deleted and the base bdev is removed from the faulty state,
+ * so no sign of this base bdev will remain in the raid.
+ */
 enum base_bdev_state {
 	BASE_BDEV_STATE_NONE,
 
-	/*
-	 * Base bdev triggered a remove event, the faulty timer is running and the delta bitmap
-	 * is being updated
-	 */
+	/* The faulty timer is running and the delta bitmap is being updated */
 	BASE_BDEV_STATE_FAULTY,
 
-	/*
-	 * Base bdev triggered a remove event, the faulty timer is running but the updating of
-	 * delta bitmap is stopped
-	 */
+	/* The faulty timer is running but the updating of the delta bitmap is stopped */
 	BASE_BDEV_STATE_FAULTY_STOPPED
 };
 
@@ -136,21 +137,21 @@ struct raid_base_bdev_info {
 	enum base_bdev_state	state;
 
 	/*
-	 * When the base bdev is in faulty state, this map records all the regions that have
+	 * When the base bdev is in faulty state, this bitmap records all the regions that have
 	 * been modified by a write operation. Region size is equal to bdev optimal_io_boundary.
-	 * Delta map can be retrieved with a RPC to speed up the rebuild of the base bdev in case
-	 * it come back online before being declared definitely dead and delta_map deleted.
+	 * Delta bitmap can be retrieved with a RPC to speed up the rebuild of the base bdev in case
+	 * it come back online before being declared definitely dead and delta_bitmap deleted.
 	 */
-	struct spdk_bit_array	*delta_map;
+	struct spdk_bit_array	*delta_bitmap;
 
-	/* The poller starts when the base bdev becomes faulty and delta_map is created.
-	 * When the poller expires, base bdev is definitely removed from the raid and
-	 * delta map deleted.
+	/* The poller starts when the base bdev becomes faulty and the delta_bitmap is created.
+	 * When the poller expires, base bdev is definitely removed from the raid and the
+	 * delta bitmap is deleted.
 	 */
 	struct spdk_poller	*poller;
 
-	/* The ticks passed when the poller started */
-	uint64_t 		poller_start_ticks;
+	/* The ticks passed since the start of the poller */
+	uint64_t		poller_start_ticks;
 };
 
 struct raid_bdev_io;
@@ -285,6 +286,9 @@ struct raid_bdev {
 
 	/* A flag to indicate that an operation to add/remove a base bdev is in progress */
 	bool				base_bdev_updating;
+
+	/* A flag to enable the recording of a delta bitmap for faulty base bdevs */
+	bool				delta_bitmap_enabled;
 };
 
 #define RAID_FOR_EACH_BASE_BDEV(r, i) \
@@ -301,7 +305,7 @@ typedef void (*raid_bdev_destruct_cb)(void *cb_ctx, int rc);
 
 int raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		     enum raid_level level, bool superblock, const struct spdk_uuid *uuid,
-		     struct raid_bdev **raid_bdev_out);
+		     bool delta_bitmap_enabled, struct raid_bdev **raid_bdev_out);
 void raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_ctx);
 int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 			    raid_base_bdev_cb cb_fn, void *cb_ctx);
@@ -317,11 +321,13 @@ int raid_bdev_grow_base_bdev(struct raid_bdev *raid_bdev, char *base_bdev_name,
 			     raid_bdev_destruct_cb cb_fn, void *cb_arg);
 struct raid_base_bdev_info *raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev);
 struct raid_base_bdev_info *raid_bdev_find_faulty_base_info_by_name(char *base_bdev_name);
-struct spdk_bit_array *raid_bdev_get_base_bdev_delta_map(char *base_bdev_name);
-bool raid_bdev_stop_base_bdev_delta_map(char *base_bdev_name);
-bool raid_bdev_clear_base_bdev_faulty_state(char *base_bdev_name);
-uint64_t raid_bdev_region_size_base_bdev_delta_map(char *base_bdev_name);
-const char *raid_bdev_delta_map_state(enum base_bdev_state value);
+struct spdk_bit_array *raid_bdev_get_base_bdev_delta_bitmap(char *base_bdev_name);
+int raid_bdev_stop_base_bdev_delta_bitmap(char *base_bdev_name, raid_bdev_destruct_cb cb_fn,
+		void *cb_arg);
+int raid_bdev_clear_base_bdev_faulty_state(char *base_bdev_name, raid_bdev_destruct_cb cb_fn,
+		void *cb_arg);
+uint64_t raid_bdev_region_size_base_bdev_delta_bitmap(char *base_bdev_name);
+const char *raid_bdev_delta_bitmap_state(enum base_bdev_state value);
 
 /*
  * RAID module descriptor
@@ -351,9 +357,6 @@ struct raid_bdev_module {
 
 	/* Set to true if this module supports DIF/DIX */
 	bool dif_supported;
-
-	/* Se to true if this module supports the recording of a delta_map for faulty base bdev */
-	bool delta_map_supported;
 
 	/*
 	 * Called when the raid is starting, right before changing the state to
@@ -404,6 +407,11 @@ struct raid_bdev_module {
 	bool (*channel_grow_base_bdev)(struct raid_bdev *raid_bdev,
 				       struct raid_bdev_io_channel *raid_ch);
 
+	/* Handle for module specific operations needed to handle faulty base bdev */
+	int (*channel_faulty_base_bdev)(struct raid_base_bdev_info *base_info,
+					struct raid_bdev_io_channel *raid_ch,
+					enum base_bdev_state newState);
+
 };
 
 void raid_bdev_module_list_add(struct raid_bdev_module *raid_module);
@@ -443,9 +451,6 @@ struct raid_bdev_io_failed {
 	uint64_t offset_blocks;
 	uint64_t num_blocks;
 };
-
-void raid_bdev_base_bdev_delta_map_update(void *ctx);
-void _raid_bdev_base_bdev_clear_faulty_state_msg(void *ctx);
 
 static inline uint8_t
 raid_bdev_base_bdev_slot(struct raid_base_bdev_info *base_info)
@@ -595,8 +600,10 @@ struct raid_bdev_superblock {
 	uint64_t		seq_number;
 	/* number of raid base devices */
 	uint8_t			num_base_bdevs;
+	/*  */
+	bool			delta_bitmap_enabled;
 
-	uint8_t			reserved[118];
+	uint8_t			reserved[116];
 
 	/* size of the base bdevs array */
 	uint8_t			base_bdevs_size;
