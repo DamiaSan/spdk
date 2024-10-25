@@ -2295,6 +2295,7 @@ enum nvme_active_ns_state {
 };
 
 typedef void (*nvme_active_ns_ctx_deleter)(struct nvme_active_ns_ctx *);
+typedef void (*nvme_active_ns_cb_fn)(void *cb_arg, int status);
 
 struct nvme_active_ns_ctx {
 	struct spdk_nvme_ctrlr *ctrlr;
@@ -2302,6 +2303,8 @@ struct nvme_active_ns_ctx {
 	uint32_t next_nsid;
 	uint32_t *new_ns_list;
 	nvme_active_ns_ctx_deleter deleter;
+	nvme_active_ns_cb_fn cb_fn;
+	void *cb_arg;
 
 	enum nvme_active_ns_state state;
 };
@@ -2438,13 +2441,15 @@ nvme_ctrlr_identify_active_ns_async_done(void *arg, const struct spdk_nvme_cpl *
 {
 	struct nvme_active_ns_ctx *ctx = arg;
 	uint32_t *new_ns_list = NULL;
+	int rc = 0;
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		ctx->state = NVME_ACTIVE_NS_STATE_ERROR;
+		rc = -ENXIO;
 		goto out;
 	}
 
-	ctx->next_nsid = ctx->new_ns_list[1024 * ctx->page_count - 1];
+	ctx->next_nsid = ctx->new_ns_list[1024 * (ctx->page_count - 1)];
 	if (ctx->next_nsid == 0) {
 		ctx->state = NVME_ACTIVE_NS_STATE_DONE;
 		goto out;
@@ -2457,6 +2462,7 @@ nvme_ctrlr_identify_active_ns_async_done(void *arg, const struct spdk_nvme_cpl *
 	if (!new_ns_list) {
 		SPDK_ERRLOG("Failed to reallocate active_ns_list!\n");
 		ctx->state = NVME_ACTIVE_NS_STATE_ERROR;
+		rc = -ENOMEM;
 		goto out;
 	}
 
@@ -2467,6 +2473,9 @@ nvme_ctrlr_identify_active_ns_async_done(void *arg, const struct spdk_nvme_cpl *
 out:
 	if (ctx->deleter) {
 		ctx->deleter(ctx);
+	}
+	if (ctx->cb_fn) {
+		ctx->cb_fn(ctx->cb_arg, rc);
 	}
 }
 
@@ -2534,6 +2543,22 @@ out:
 }
 
 static void
+_nvme_active_ns_ctx_deleter_async(struct nvme_active_ns_ctx *ctx)
+{
+	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
+
+	if (ctx->state == NVME_ACTIVE_NS_STATE_ERROR) {
+		nvme_active_ns_ctx_destroy(ctx);
+		return;
+	}
+
+	assert(ctx->state == NVME_ACTIVE_NS_STATE_DONE);
+
+	nvme_ctrlr_identify_active_ns_swap(ctrlr, ctx->new_ns_list, ctx->page_count * 1024);
+	nvme_active_ns_ctx_destroy(ctx);
+}
+
+static void
 _nvme_active_ns_ctx_deleter(struct nvme_active_ns_ctx *ctx)
 {
 	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
@@ -2554,6 +2579,23 @@ _nvme_active_ns_ctx_deleter(struct nvme_active_ns_ctx *ctx)
 	nvme_ctrlr_identify_active_ns_swap(ctrlr, ctx->new_ns_list, ctx->page_count * 1024);
 	nvme_active_ns_ctx_destroy(ctx);
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_IDENTIFY_NS, ctrlr->opts.admin_timeout_ms);
+}
+
+static void
+_nvme_ctrlr_identify_active_ns_async(struct spdk_nvme_ctrlr *ctrlr, nvme_active_ns_cb_fn cb_fn, void *cb_arg)
+{
+	struct nvme_active_ns_ctx *ctx;
+
+	ctx = nvme_active_ns_ctx_create(ctrlr, _nvme_active_ns_ctx_deleter_async);
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	nvme_ctrlr_identify_active_ns_async(ctx);
 }
 
 static void
@@ -3182,16 +3224,26 @@ nvme_ctrlr_update_namespaces(struct spdk_nvme_ctrlr *ctrlr)
 }
 
 static void
-nvme_ctrlr_reenumerate_active_ns(struct spdk_nvme_ctrlr *ctrlr)
+nvme_ctrlr_reenumerate_active_ns(void *cb_arg, int status)
 {
-	int rc;
+	struct spdk_nvme_ctrlr_aer_completion *async_event = cb_arg;
+	struct spdk_nvme_ctrlr *ctrlr = async_event->ctrlr;
+	struct spdk_nvme_ctrlr_process *active_proc;
 
-	rc = nvme_ctrlr_identify_active_ns(ctrlr);
-	if (rc) {
+	if (status) {
 		return;
 	}
+
 	nvme_ctrlr_update_namespaces(ctrlr);
 	nvme_io_msg_ctrlr_update(ctrlr);
+
+	/* Complete the handling of the async request */
+	active_proc = nvme_ctrlr_get_current_process(ctrlr);
+	if (active_proc && active_proc->aer_cb_fn) {
+		active_proc->aer_cb_fn(active_proc->aer_cb_arg, &async_event->cpl);
+	}
+
+	spdk_free(async_event);
 }
 
 static void
@@ -3200,7 +3252,6 @@ nvme_ctrlr_clear_changed_ns_log_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 	struct spdk_nvme_ctrlr_aer_completion *async_event = arg;
 	char *buffer = async_event->buffer;
 	struct spdk_nvme_ctrlr *ctrlr = async_event->ctrlr;
-	struct spdk_nvme_ctrlr_process *active_proc;
 	uint32_t nsid;
 
 	/* only check the case of overflow. */
@@ -3211,14 +3262,7 @@ nvme_ctrlr_clear_changed_ns_log_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 
 	spdk_dma_free(buffer);
 
-	nvme_ctrlr_reenumerate_active_ns(ctrlr);
-
-	active_proc = nvme_ctrlr_get_current_process(ctrlr);
-	if (active_proc && active_proc->aer_cb_fn) {
-		active_proc->aer_cb_fn(active_proc->aer_cb_arg, &async_event->cpl);
-	}
-
-	spdk_free(async_event);
+	_nvme_ctrlr_identify_active_ns_async(ctrlr, nvme_ctrlr_reenumerate_active_ns, async_event);
 }
 
 static int
